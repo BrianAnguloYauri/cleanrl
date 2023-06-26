@@ -13,7 +13,121 @@ import torch.nn.functional as F
 import torch.optim as optim
 from stable_baselines3.common.buffers import ReplayBuffer
 from torch.utils.tensorboard import SummaryWriter
+from gym.envs.registration import register
+from polamp_env.lib.utils_operations import generateDataSet
+import json
+import os
+import copy
 
+print(f"we are here {os. getcwd()}")
+
+dir = "polamp_env/"
+with open(dir + "configs/environment_configs.json", 'r') as f:
+    our_env_config = json.load(f)
+
+with open(dir + "configs/reward_weight_configs.json", 'r') as f:
+    reward_config = json.load(f)
+
+with open(dir + "configs/car_configs.json", 'r') as f:
+    car_config = json.load(f)
+
+dataSet = generateDataSet(our_env_config, name_folder= dir + "safety", total_maps=1, dynamic=False)
+# dataSet = generateDataSet(our_env_config, name_folder= dir + "maps", total_maps=12, dynamic=False)
+
+def validate(env, actor, max_steps, save_image=False, id=None, val_key=None):
+    if id is None or val_key is None:
+        return
+    actor.eval()
+    state = env.reset(id=id, val_key=val_key)
+    if save_image:
+        images = []
+        images.append(env.render())
+    isDone = False
+    t = 0
+    sum_reward = 0
+    episode_constrained = []
+    episode_min_beam = []
+    obs = torch.zeros((1, env.observation_space.shape[0]), dtype=torch.float32).to(device)
+    while not isDone and t < max_steps:
+        obs[0] = torch.Tensor(state).to(device)
+        _, _, mean = actor.get_action(obs)
+        action = mean.detach().cpu().numpy()[0]
+        state, reward, isDone, info = env.step(action)
+        sum_reward += reward
+        episode_constrained.append(info.get('cost', 0))
+        episode_min_beam.append(env.environment.min_beam)
+        if save_image:
+            images.append(env.render())
+        t += 1
+        
+    env.close()
+    if save_image:
+        images = np.transpose(np.array(images), axes=[0, 3, 1, 2])
+    return sum_reward if not save_image else images, isDone, info, np.mean(episode_constrained), np.min(episode_min_beam) 
+
+def validation(env, agent):
+    print("### Validation ###")
+    actor = copy.deepcopy(agent)
+    actor.eval()
+    # actor.load_state_dict(torch.load(f'runs/{run_name}/actor.pkl'))
+    collision_tasks = 0
+    successed_tasks = 0
+    total_tasks = 0
+    constrained_cost = []
+    lst_min_beam = []
+    print(env)
+    for val_key in env.valTasks:
+        eval_tasks = len(env.valTasks[val_key])
+        total_tasks += eval_tasks
+        print(f"val_key: {val_key}")
+        print(f"eval_tasks: {eval_tasks}")
+        for id in range(eval_tasks):
+            images, isDone, info, episode_cost, min_beam = validate(env, actor, 250, id=id, val_key=val_key)
+            constrained_cost.append(episode_cost)
+            lst_min_beam.append(min_beam)
+            if isDone:
+                if "Collision" in info:
+                    # collision = True
+                    # isDone = False
+                    print("$$ Collision $$")
+                    print(f"val_key: {val_key}")
+                    print(f"id: {id}")
+                    collision_tasks += 1
+                elif "SoftEps" in info:
+                    print("$$ SoftEps $$")
+                else:
+                    successed_tasks += 1
+
+    success_rate = successed_tasks / total_tasks * 100
+    collision_rate = collision_tasks / total_tasks * 100
+    print(f"success_rate: {success_rate}")
+    print(f"collision_rate: {collision_rate}")
+    print(f"mean constrained_cost: {np.mean(constrained_cost)}")
+    print(f"max constrained_cost: {np.max(constrained_cost)}")
+    print(f"min constrained_cost: {np.min(constrained_cost)}")
+    print(f"mean lst_min_beam: {np.mean(lst_min_beam)}")
+    print(f"max lst_min_beam: {np.max(lst_min_beam)}")
+    print(f"min lst_min_beam: {np.min(lst_min_beam)}")
+
+    return collision_rate, success_rate
+
+maps, trainTask, valTasks = dataSet["obstacles"]
+environment_config = {
+        'vehicle_config': car_config,
+        'tasks': trainTask,
+        'valTasks': valTasks,
+        'maps': maps,
+        'our_env_config' : our_env_config,
+        'reward_config' : reward_config,
+        'evaluation': {},
+    }
+
+train_env_name = "polamp_env-v0"
+register(
+    id=train_env_name,
+    entry_point='polamp_env.lib.envs:POLAMPEnvironment',
+    kwargs={'full_env_name': "polamp_env", "config": environment_config}
+)
 
 def parse_args():
     # fmt: off
@@ -40,6 +154,8 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
+    parser.add_argument("--validation-timesteps", type=int, default=50000,
+        help="validation timesteps frequency")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
     parser.add_argument("--gamma", type=float, default=0.99,
@@ -174,6 +290,7 @@ if __name__ == "__main__":
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
     # env setup
+    validation_env = gym.make(args.env_id)
     envs = gym.vector.SyncVectorEnv([make_env(args.env_id, args.seed, 0, args.capture_video, run_name)])
     assert isinstance(envs.single_action_space, gym.spaces.Box), "only continuous action space is supported"
 
@@ -282,6 +399,12 @@ if __name__ == "__main__":
                         alpha_loss.backward()
                         a_optimizer.step()
                         alpha = log_alpha.exp().item()
+                
+                torch.save(actor.state_dict(), f'runs/{run_name}/actor.pkl')
+            if global_step % args.validation_timesteps == 0:
+                collision_rate, success_rate = validation(validation_env, actor)
+                writer.add_scalar("validation/collision_rate", collision_rate, global_step)
+                writer.add_scalar("validation/success_rate", success_rate, global_step)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
