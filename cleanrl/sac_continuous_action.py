@@ -31,8 +31,8 @@ with open(dir + "configs/reward_weight_configs.json", 'r') as f:
 with open(dir + "configs/car_configs.json", 'r') as f:
     car_config = json.load(f)
 
-dataSet = generateDataSet(our_env_config, name_folder= dir + "safety", total_maps=1, dynamic=False)
-# dataSet = generateDataSet(our_env_config, name_folder= dir + "maps", total_maps=12, dynamic=False)
+# dataSet = generateDataSet(our_env_config, name_folder= dir + "safety", total_maps=1, dynamic=False)
+dataSet = generateDataSet(our_env_config, name_folder= dir + "maps", total_maps=12, dynamic=False)
 
 def validate(env, actor, max_steps, save_image=False, id=None, val_key=None):
     if id is None or val_key is None:
@@ -75,6 +75,7 @@ def validation(env, agent):
     total_tasks = 0
     constrained_cost = []
     lst_min_beam = []
+    results_dictionary = {}
     print(env)
     for val_key in env.valTasks:
         eval_tasks = len(env.valTasks[val_key])
@@ -100,16 +101,16 @@ def validation(env, agent):
 
     success_rate = successed_tasks / total_tasks * 100
     collision_rate = collision_tasks / total_tasks * 100
-    print(f"success_rate: {success_rate}")
-    print(f"collision_rate: {collision_rate}")
-    print(f"mean constrained_cost: {np.mean(constrained_cost)}")
-    print(f"max constrained_cost: {np.max(constrained_cost)}")
-    print(f"min constrained_cost: {np.min(constrained_cost)}")
-    print(f"mean lst_min_beam: {np.mean(lst_min_beam)}")
-    print(f"max lst_min_beam: {np.max(lst_min_beam)}")
-    print(f"min lst_min_beam: {np.min(lst_min_beam)}")
+    results_dictionary["success_rate"] = success_rate
+    results_dictionary["collision_rate"] = collision_rate
+    results_dictionary["mean_constrained_cost"] = np.mean(constrained_cost)
+    results_dictionary["max_constrained_cost"] = np.max(constrained_cost)
+    results_dictionary["min_constrained_cost"] = np.min(constrained_cost)
+    results_dictionary["mean_beam"] = np.mean(lst_min_beam)
+    results_dictionary["min_beam"] = np.min(lst_min_beam)
+    results_dictionary["max_beam"] = np.max(lst_min_beam)
 
-    return collision_rate, success_rate
+    return results_dictionary
 
 maps, trainTask, valTasks = dataSet["obstacles"]
 environment_config = {
@@ -154,7 +155,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--validation-timesteps", type=int, default=50000,
+    parser.add_argument("--validation-timesteps", type=int, default=20000,
         help="validation timesteps frequency")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -402,9 +403,9 @@ if __name__ == "__main__":
                 
                 torch.save(actor.state_dict(), f'runs/{run_name}/actor.pkl')
             if global_step % args.validation_timesteps == 0:
-                collision_rate, success_rate = validation(validation_env, actor)
-                writer.add_scalar("validation/collision_rate", collision_rate, global_step)
-                writer.add_scalar("validation/success_rate", success_rate, global_step)
+                results_dictionary = validation(validation_env, actor)
+                for key in results_dictionary:
+                    writer.add_scalar("validation/" + key, results_dictionary[key], global_step)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
