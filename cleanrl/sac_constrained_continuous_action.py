@@ -75,6 +75,7 @@ def validation(env, agent):
     total_tasks = 0
     constrained_cost = []
     lst_min_beam = []
+    results_dictionary = {}
     print(env)
     for val_key in env.valTasks:
         eval_tasks = len(env.valTasks[val_key])
@@ -100,16 +101,16 @@ def validation(env, agent):
 
     success_rate = successed_tasks / total_tasks * 100
     collision_rate = collision_tasks / total_tasks * 100
-    print(f"success_rate: {success_rate}")
-    print(f"collision_rate: {collision_rate}")
-    print(f"mean constrained_cost: {np.mean(constrained_cost)}")
-    print(f"max constrained_cost: {np.max(constrained_cost)}")
-    print(f"min constrained_cost: {np.min(constrained_cost)}")
-    print(f"mean lst_min_beam: {np.mean(lst_min_beam)}")
-    print(f"max lst_min_beam: {np.max(lst_min_beam)}")
-    print(f"min lst_min_beam: {np.min(lst_min_beam)}")
+    results_dictionary["success_rate"] = success_rate
+    results_dictionary["collision_rate"] = collision_rate
+    results_dictionary["mean_constrained_cost"] = np.mean(constrained_cost)
+    results_dictionary["max_constrained_cost"] = np.max(constrained_cost)
+    results_dictionary["min_constrained_cost"] = np.min(constrained_cost)
+    results_dictionary["mean_beam"] = np.mean(lst_min_beam)
+    results_dictionary["min_beam"] = np.min(lst_min_beam)
+    results_dictionary["max_beam"] = np.max(lst_min_beam)
 
-    return collision_rate, success_rate
+    return results_dictionary
 
 maps, trainTask, valTasks = dataSet["obstacles"]
 environment_config = {
@@ -154,7 +155,7 @@ def parse_args():
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=1000000,
         help="total timesteps of the experiments")
-    parser.add_argument("--validation-timesteps", type=int, default=50000,
+    parser.add_argument("--validation-timesteps", type=int, default=20000,
         help="validation timesteps frequency")
     parser.add_argument("--buffer-size", type=int, default=int(1e6),
         help="the replay memory buffer size")
@@ -308,6 +309,7 @@ if __name__ == "__main__":
 
     #Adding by Brian
     cost_limit = 0.5
+    update_lambda = 1000
     qf1_cost = SoftQNetwork(envs).to(device)
     qf2_cost = SoftQNetwork(envs).to(device)
     qf1_target_cost = SoftQNetwork(envs).to(device)
@@ -315,7 +317,7 @@ if __name__ == "__main__":
     qf1_target_cost.load_state_dict(qf1_cost.state_dict())
     qf2_target_cost.load_state_dict(qf2_cost.state_dict())
     q_optimizer_cost = optim.Adam(list(qf1_cost.parameters()) + list(qf2_cost.parameters()), lr=args.q_lr)
-    lambda_coefficient = torch.tensor(0.1, requires_grad=True)
+    lambda_coefficient = torch.tensor(1.0, requires_grad=True)
     lambda_optimizer = optim.Adam([lambda_coefficient], lr=5e-4)
 
     # Automatic entropy tuning
@@ -410,7 +412,6 @@ if __name__ == "__main__":
             qf_loss_cost.backward()
             q_optimizer_cost.step()
             
-
             if global_step % args.policy_frequency == 0:  # TD 3 Delayed update support
                 for _ in range(
                     args.policy_frequency
@@ -422,9 +423,10 @@ if __name__ == "__main__":
                     # actor_loss = ((alpha * log_pi) - min_qf_pi).mean()
                     
                     # Adding by Brian
+                    lambda_multiplier = torch.nn.functional.softplus(lambda_coefficient)
                     qf1_pi_cost = qf1_cost(data.observations, pi)
                     qf2_pi_cost = qf2_cost(data.observations, pi)
-                    min_qf_pi_cost = lambda_coefficient * torch.min(qf1_pi_cost, qf2_pi_cost).view(-1)
+                    min_qf_pi_cost = lambda_multiplier * torch.min(qf1_pi_cost, qf2_pi_cost).view(-1)
 
                     actor_loss = ((alpha * log_pi) - min_qf_pi + min_qf_pi_cost).mean()
 
@@ -444,20 +446,21 @@ if __name__ == "__main__":
             
                 torch.save(actor.state_dict(), f'runs/{run_name}/actor.pkl')
             #Lagrangian
-            qf1_a_values_cost = qf1_cost(data.observations, data.actions).view(-1)
-            qf2_a_values_cost = qf2_cost(data.observations, data.actions).view(-1)
-            violation = torch.min(qf1_a_values_cost, qf2_a_values_cost) - cost_limit
-            log_lam = torch.nn.functional.softplus(lambda_coefficient)
-            lambda_loss =  log_lam * violation.detach()
-            lambda_loss = -lambda_loss.sum(dim=-1)
-            lambda_optimizer.zero_grad()
-            lambda_loss.backward()
-            lambda_optimizer.step()
+            if global_step % update_lambda:
+                qf1_a_values_cost = qf1_cost(data.observations, data.actions).view(-1)
+                qf2_a_values_cost = qf2_cost(data.observations, data.actions).view(-1)
+                violation = torch.min(qf1_a_values_cost, qf2_a_values_cost) - cost_limit
+                # log_lam = torch.nn.functional.softplus(lambda_coefficient)
+                lambda_loss =  lambda_coefficient * violation.detach()
+                lambda_loss = -lambda_loss.sum(dim=-1)
+                lambda_optimizer.zero_grad()
+                lambda_loss.backward()
+                lambda_optimizer.step()
         
             if global_step % args.validation_timesteps == 0:
-                collision_rate, success_rate = validation(validation_env, actor)
-                writer.add_scalar("validation/collision_rate", collision_rate, global_step)
-                writer.add_scalar("validation/success_rate", success_rate, global_step)
+                results_dictionary = validation(validation_env, actor)
+                for key in results_dictionary:
+                    writer.add_scalar("validation/" + key, results_dictionary[key], global_step)
 
             # update the target networks
             if global_step % args.target_network_frequency == 0:
@@ -479,7 +482,7 @@ if __name__ == "__main__":
                 writer.add_scalar("losses/qf_loss_cost", qf_loss_cost.item() / 2.0, global_step)
                 writer.add_scalar("losses/actor_loss", actor_loss.item(), global_step)
                 writer.add_scalar("losses/alpha", alpha, global_step)
-                writer.add_scalar("losses/lambda", log_lam, global_step)
+                writer.add_scalar("losses/lambda", lambda_multiplier, global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 if args.autotune:
